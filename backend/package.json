@@ -1,0 +1,51 @@
+{
+  "name": "agents",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "nodemon server.js",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "apos-to-lex-form": "^1.0.5",
+    "axios": "^1.7.9",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "compromise": "^14.14.4",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "express-session": "^1.18.1",
+    "firebase": "^11.3.1",
+    "framer-motion": "^12.0.5",
+    "googleapis": "^144.0.0",
+    "imap": "^0.8.19",
+    "ioredis": "^5.5.0",
+    "lodash": "^4.17.21",
+    "lucide-react": "^0.474.0",
+    "mailparser": "^3.7.2",
+    "mongodb": "^6.12.0",
+    "mongoose": "^8.9.5",
+    "natural": "^8.0.1",
+    "next": "15.1.6",
+    "node-cache": "^5.1.2",
+    "node-nlp": "^5.0.0-alpha.5",
+    "nodemailer": "^6.10.0",
+    "openai": "^4.88.0",
+    "p-limit": "^6.2.0",
+    "sentiment": "^5.0.2",
+    "spelling-corrector": "^3.0.0",
+    "stopword": "^3.1.4",
+    "tls": "^0.0.1",
+    "xoauth2": "^1.2.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.9",
+    "postcss": "^8",
+    "tailwindcss": "^3.4.1"
+  }
+}
