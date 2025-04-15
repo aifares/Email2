@@ -143,9 +143,9 @@ export async function getThreadDetailsNoCache(gmail, threadIds, user) {
 
     // Introduce a delay after each batch.
     console.log(
-      "getThreadDetailsNoCache: Waiting 1 second before next batch..."
+      "getThreadDetailsNoCache: Waiting 9 second before next batch..."
     );
-    await sleep(5000);
+    await sleep(9000);
   }
 
   console.log("getThreadDetailsNoCache: Finished fetching thread details.");

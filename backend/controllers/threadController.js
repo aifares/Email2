@@ -3,8 +3,6 @@ import User from "../Models/User.js";
 import { oauth2Client } from "../routes/authRoutes.js";
 import redis from "../config/redisClient.js";
 import {
-  getAllThreads,
-  getThreadDetails,
   prefetchThreads,
   decodeMessageBody,
 } from "../utils/gmailService.js";
@@ -13,9 +11,6 @@ import {
   getDefaultClassifierModel,
 } from "../utils/nlpAnalyzer.js";
 
-const INITIAL_FETCH_SIZE = 100;
-const PREFETCH_THRESHOLD = 0.75;
-const PREFETCH_SIZE = 100;
 
 export const getEmails = async (req, res) => {
   try {

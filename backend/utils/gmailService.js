@@ -12,7 +12,10 @@ const SEARCH_RESULTS_CACHE_KEY = "search-results";
 const gmailApiLimit = pLimit(10);
 
 export const getUserCacheKey = (firebaseUid, params) => {
-  return `user:${firebaseUid}:search:${JSON.stringify(params)}`;
+  if (params) {
+    return `user:${firebaseUid}:search:${JSON.stringify(params)}`;
+  }
+  return `user:${firebaseUid}`;
 };
 
 export function decodeMessageBody(payload) {
@@ -392,5 +395,47 @@ export const getSearchResultsWithCache = async (
       );
     }
     throw error;
+  }
+};
+
+/**
+ * Retrieves all cached thread data for a specific user from Redis
+ * @param {string} firebaseUid - The user's Firebase UID
+ * @param {object} redis - Redis client instance
+ * @returns {Promise<Array>} - Array of cached thread objects
+ */
+export const getCachedThreads = async (firebaseUid, redis) => {
+  try {
+    // Get the base key for the user
+    const cacheKey = getUserCacheKey(firebaseUid);
+
+    // Find all keys related to this user's threads
+    const threadKeys = await redis.keys(`${cacheKey}:thread:*`);
+
+    if (!threadKeys || threadKeys.length === 0) {
+      return [];
+    }
+
+    // Get all thread data from Redis
+    const cachedThreadsData = await Promise.all(
+      threadKeys.map(async (key) => {
+        try {
+          const data = await redis.get(key);
+          return data ? JSON.parse(data) : null;
+        } catch (error) {
+          console.error(
+            `Error parsing cached thread data for key ${key}:`,
+            error
+          );
+          return null;
+        }
+      })
+    );
+
+    // Filter out null values
+    return cachedThreadsData.filter((thread) => thread !== null);
+  } catch (error) {
+    console.error("Error retrieving cached threads:", error);
+    return [];
   }
 };

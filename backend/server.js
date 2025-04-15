@@ -13,6 +13,7 @@ import classifierRoutes from "./routes/classifierRoutes.js";
 import analyticsRoutes from "./routes/analyticsRoutes.js";
 import agentRoutes from "./routes/agentRoutes.js";
 import insightRoutes from "./routes/insightRoutes.js";
+import firebaseAuthRoutes from "./routes/firebaseAuthRoutes.js";
 
 const app = express();
 
@@ -52,3 +53,4 @@ app.use("/api/classifier", classifierRoutes);
 app.use("/analytics", analyticsRoutes);
 app.use("/agents", agentRoutes);
 app.use("/insights", insightRoutes);
+app.use("/firebase-auth", firebaseAuthRoutes);
