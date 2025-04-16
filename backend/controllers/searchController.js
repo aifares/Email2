@@ -4,7 +4,6 @@ import {
   getAllThreads,
   getSearchResultsWithCache,
   getThreadDetails,
-  getCachedThreads,
 } from "../utils/gmailService.js";
 import redis from "../config/redisClient.js";
 import { oauth2Client } from "../routes/authRoutes.js";
@@ -258,41 +257,273 @@ export const searchEmails = async (req, res) => {
           // Continue with the existing search logic as fallback
         }
       } else {
-        // --- Hybrid search approach: Query both MongoDB and Redis cache ---
-        console.log("Using hybrid search approach for filtered results");
+        // --- Combined approach: Check both MongoDB and Redis cache ---
+        console.log("Filtering by sentiment/classification");
 
-        // Track all processed thread IDs to avoid duplicates
-        const processedThreadIds = new Set();
-        let allThreadDetails = [];
+        // First check Redis cache for matching threads
+        try {
+          console.log("Checking Redis cache for matching threads");
 
-        // STEP 1: Query MongoDB for emails matching the filter criteria
+          // Get thread details cache - correct key based on actual Redis structure
+          const threadDetailsKey = `user:thread-details:search:"${firebaseUid}"`;
+          const cachedDetailsStr = await redis.get(threadDetailsKey);
+
+          if (cachedDetailsStr) {
+            console.log("Found cached thread details in Redis");
+
+            const cachedDetails = JSON.parse(cachedDetailsStr);
+            const cachedThreads = [];
+
+            // Convert the object to an array of threads with IDs
+            for (const [threadId, details] of Object.entries(cachedDetails)) {
+              if (details) {
+                cachedThreads.push({
+                  threadId,
+                  ...details,
+                  classification: details.classification || "Unknown",
+                  sentiment: details.sentiment || "neutral",
+                });
+              }
+            }
+
+            // Filter by sentiment/classification
+            let filteredCachedThreads = cachedThreads;
+
+            if (filter && filter !== "all") {
+              console.log(
+                `Filtering Redis results by classification: ${filter}`
+              );
+              filteredCachedThreads = filteredCachedThreads.filter(
+                (thread) => thread.classification === filter
+              );
+            }
+
+            if (sentiment && sentiment !== "all") {
+              console.log(`Filtering Redis results by sentiment: ${sentiment}`);
+              // Handle case-insensitive comparison for sentiment
+              const normalizedSentiment = sentiment.toLowerCase();
+              filteredCachedThreads = filteredCachedThreads.filter((thread) => {
+                // Check various formats the sentiment might be stored in
+                const threadSentiment = thread.sentiment
+                  ? thread.sentiment.toLowerCase()
+                  : "";
+                console.log(
+                  `Thread ${thread.threadId} has sentiment: ${threadSentiment}`
+                );
+
+                return (
+                  threadSentiment === normalizedSentiment ||
+                  // Check for alternative formats
+                  (normalizedSentiment === "positive" &&
+                    threadSentiment.includes("posit")) ||
+                  (normalizedSentiment === "negative" &&
+                    threadSentiment.includes("negat")) ||
+                  (normalizedSentiment === "neutral" &&
+                    threadSentiment.includes("neutr"))
+                );
+              });
+            }
+
+            console.log(
+              `Found ${filteredCachedThreads.length} matching threads in Redis cache`
+            );
+
+            // Store the Redis results to combine with MongoDB later
+            if (filteredCachedThreads.length > 0) {
+              // Save ThreadIDs we've found in Redis to avoid duplicates
+              const redisThreadIds = new Set(
+                filteredCachedThreads.map((thread) => thread.threadId)
+              );
+
+              // Get results from MongoDB too, excluding ones we already have from Redis
+              console.log("Now checking MongoDB for additional results");
+
+              let mongoQuery = { userId: user._id };
+
+              // Add filters
+              if (filter && filter !== "all") {
+                console.log(`Filtering MongoDB by classification: ${filter}`);
+                mongoQuery["AIAnalysis.classification"] = filter;
+              }
+
+              if (sentiment && sentiment !== "all") {
+                console.log(`Filtering MongoDB by sentiment: ${sentiment}`);
+                // Create a case-insensitive regex query for sentiment
+                const sentimentRegex = new RegExp(`^${sentiment}$`, "i");
+                mongoQuery["AIAnalysis.sentiment"] = sentimentRegex;
+              }
+
+              // Exclude threads we already have from Redis
+              if (redisThreadIds.size > 0) {
+                mongoQuery.threadId = { $nin: Array.from(redisThreadIds) };
+              }
+
+              console.log("MongoDB query:", JSON.stringify(mongoQuery));
+
+              // Get total count for pagination info
+              const totalMongoCount = await Email.countDocuments(mongoQuery);
+              console.log(
+                `Found ${totalMongoCount} additional matching documents in MongoDB`
+              );
+
+              // Get all results from MongoDB (not paginated yet)
+              const classifiedEmails = await Email.find(mongoQuery)
+                .sort({ emailDate: -1 })
+                .lean();
+
+              console.log(
+                `Retrieved ${classifiedEmails.length} additional emails from MongoDB`
+              );
+
+              // Process MongoDB results
+              const mongoThreadDetailsPromises = classifiedEmails.map(
+                async (classifiedEmail) => {
+                  try {
+                    const threadData = await gmail.users.threads.get({
+                      userId: "me",
+                      id: classifiedEmail.threadId,
+                      format: "metadata",
+                      metadataHeaders: ["Subject", "From", "Date"],
+                    });
+
+                    const messages = threadData.data.messages;
+                    if (!messages || messages.length === 0) {
+                      console.warn(
+                        `Thread ${classifiedEmail.threadId} has no messages`
+                      );
+                      return null;
+                    }
+
+                    // Get the first message (original sender) and last message
+                    const firstMessage = messages[0];
+                    const latestMessage = messages[messages.length - 1];
+                    const headers = latestMessage.payload.headers;
+                    const originalHeaders = firstMessage.payload.headers;
+                    const dateString =
+                      headers.find((h) => h.name === "Date")?.value || "";
+                    const parsedDate = new Date(dateString);
+
+                    return {
+                      threadId: classifiedEmail.threadId,
+                      messageCount: messages.length,
+                      subject:
+                        headers.find((h) => h.name === "Subject")?.value ||
+                        "No Subject",
+                      from:
+                        headers.find((h) => h.name === "From")?.value ||
+                        "Unknown Sender",
+                      originalFrom:
+                        originalHeaders.find((h) => h.name === "From")?.value ||
+                        "",
+                      date: dateString,
+                      parsedDate: isNaN(parsedDate) ? new Date(0) : parsedDate,
+                      snippet: latestMessage.snippet,
+                      classification:
+                        classifiedEmail.AIAnalysis?.classification,
+                      sentiment: classifiedEmail.AIAnalysis?.sentiment,
+                    };
+                  } catch (error) {
+                    console.error(
+                      `Error fetching details for thread ${classifiedEmail.threadId}:`,
+                      error
+                    );
+                    return null;
+                  }
+                }
+              );
+
+              const mongoThreadDetails = (
+                await Promise.all(mongoThreadDetailsPromises)
+              ).filter((detail) => detail !== null);
+
+              // Combine results from Redis and MongoDB
+              console.log(
+                `Combining ${filteredCachedThreads.length} Redis results with ${mongoThreadDetails.length} MongoDB results`
+              );
+              const allThreadDetails = [
+                ...filteredCachedThreads,
+                ...mongoThreadDetails,
+              ];
+
+              // Sort all results by date
+              allThreadDetails.sort((a, b) => {
+                const dateA =
+                  a.parsedDate || (a.date ? new Date(a.date) : new Date(0));
+                const dateB =
+                  b.parsedDate || (b.date ? new Date(b.date) : new Date(0));
+                return dateB - dateA;
+              });
+
+              // Apply pagination to combined results
+              const startIndex = (parseInt(page) - 1) * parseInt(pageSize);
+              const endIndex = startIndex + parseInt(pageSize);
+              filteredEmails = allThreadDetails.slice(startIndex, endIndex);
+
+              // Calculate pagination info
+              totalResults = allThreadDetails.length;
+              hasMore = endIndex < totalResults;
+
+              console.log(
+                `Returning ${
+                  filteredEmails.length
+                } emails from combined sources (page ${page} of ${Math.ceil(
+                  totalResults / parseInt(pageSize)
+                )})`
+              );
+
+              return res.json({
+                emails: filteredEmails,
+                pagination: {
+                  page: parseInt(page),
+                  pageSize: parseInt(pageSize),
+                  hasMore,
+                  totalResults,
+                  nextPageToken: null,
+                },
+              });
+            }
+          }
+        } catch (error) {
+          console.error("Error querying Redis cache:", error);
+          // Continue to MongoDB as fallback
+        }
+
+        // Fallback to MongoDB if Redis doesn't have matching results
+        console.log("Falling back to MongoDB for filtering");
+
         let mongoQuery = { userId: user._id };
 
         if (filter && filter !== "all") {
+          console.log(`Filtering MongoDB by classification: ${filter}`);
           mongoQuery["AIAnalysis.classification"] = filter;
         }
+
         if (sentiment && sentiment !== "all") {
-          mongoQuery["AIAnalysis.sentiment"] = sentiment;
+          console.log(`Filtering MongoDB by sentiment: ${sentiment}`);
+          // Create a case-insensitive regex query for sentiment
+          const sentimentRegex = new RegExp(`^${sentiment}$`, "i");
+          mongoQuery["AIAnalysis.sentiment"] = sentimentRegex;
+
+          // Log the MongoDB query for debugging
+          console.log("MongoDB query:", JSON.stringify(mongoQuery));
         }
 
-        console.log("MongoDB query:", mongoQuery);
+        totalResults = await Email.countDocuments(mongoQuery);
+        const startIndex = (parseInt(page) - 1) * parseInt(pageSize);
+
         const classifiedEmails = await Email.find(mongoQuery)
           .sort({ emailDate: -1 })
+          .skip(startIndex)
+          .limit(parseInt(pageSize))
           .lean();
 
-        console.log(`Found ${classifiedEmails.length} emails in MongoDB`);
+        console.log(
+          `Found ${classifiedEmails.length} matching emails in MongoDB`
+        );
 
-        // Process MongoDB results
-        const mongoThreadDetailsPromises = classifiedEmails.map(
+        const threadDetailsPromises = classifiedEmails.map(
           async (classifiedEmail) => {
             try {
-              // Skip if we've already processed this thread
-              if (processedThreadIds.has(classifiedEmail.threadId)) {
-                return null;
-              }
-
-              processedThreadIds.add(classifiedEmail.threadId);
-
               const threadData = await gmail.users.threads.get({
                 userId: "me",
                 id: classifiedEmail.threadId,
@@ -316,6 +547,12 @@ export const searchEmails = async (req, res) => {
               const dateString =
                 headers.find((h) => h.name === "Date")?.value || "";
               const parsedDate = new Date(dateString);
+
+              if (isNaN(parsedDate.getTime())) {
+                console.warn(
+                  `Invalid date string for thread ${classifiedEmail.threadId}: ${dateString}`
+                );
+              }
 
               // Update the email date in the database if it's different
               if (
@@ -353,109 +590,25 @@ export const searchEmails = async (req, res) => {
           }
         );
 
-        const mongoThreadDetails = (
-          await Promise.all(mongoThreadDetailsPromises)
-        ).filter((detail) => detail !== null);
+        let threadDetails = (await Promise.all(threadDetailsPromises)).filter(
+          (detail) => detail !== null
+        );
 
-        allThreadDetails = [...mongoThreadDetails];
+        // Ensure no duplicate threads
+        const uniqueThreads = [];
+        const seenThreadIds = new Set();
 
-        // STEP 2: Query Redis cache for additional threads
-        try {
-          console.log("Querying Redis cache for additional threads");
-
-          // Get all cached threads for this user
-          const cacheKey = getUserCacheKey(firebaseUid);
-          const cachedThreadKeys = await redis.keys(`${cacheKey}:thread:*`);
-
-          if (cachedThreadKeys.length > 0) {
-            console.log(
-              `Found ${cachedThreadKeys.length} cached threads in Redis`
-            );
-
-            // Get all cached thread data
-            const cachedThreadsData = await Promise.all(
-              cachedThreadKeys.map(async (key) => {
-                const data = await redis.get(key);
-                return data ? JSON.parse(data) : null;
-              })
-            );
-
-            // Filter cached threads based on sentiment/classification
-            const filteredCachedThreads = cachedThreadsData.filter((thread) => {
-              if (!thread) return false;
-
-              // Skip if we've already processed this thread from MongoDB
-              if (processedThreadIds.has(thread.threadId)) return false;
-
-              // Apply filters
-              if (
-                filter &&
-                filter !== "all" &&
-                thread.classification !== filter
-              )
-                return false;
-              if (
-                sentiment &&
-                sentiment !== "all" &&
-                thread.sentiment !== sentiment
-              )
-                return false;
-
-              // Mark as processed
-              processedThreadIds.add(thread.threadId);
-              return true;
-            });
-
-            console.log(
-              `Found ${filteredCachedThreads.length} matching threads in Redis cache`
-            );
-
-            // Add filtered cached threads to our results
-            if (filteredCachedThreads.length > 0) {
-              // Format cached threads to match our response structure
-              const formattedCachedThreads = filteredCachedThreads.map(
-                (thread) => ({
-                  threadId: thread.threadId,
-                  messageCount: thread.messageCount || 1,
-                  subject: thread.subject || "No Subject",
-                  from: thread.from || "Unknown Sender",
-                  originalFrom: thread.originalFrom || "",
-                  date: thread.date || "",
-                  parsedDate: thread.parsedDate
-                    ? new Date(thread.parsedDate)
-                    : new Date(0),
-                  snippet: thread.snippet || "",
-                  classification: thread.classification,
-                  sentiment: thread.sentiment,
-                })
-              );
-
-              allThreadDetails = [
-                ...allThreadDetails,
-                ...formattedCachedThreads,
-              ];
-            }
+        for (const thread of threadDetails) {
+          if (!seenThreadIds.has(thread.threadId)) {
+            seenThreadIds.add(thread.threadId);
+            uniqueThreads.push(thread);
           }
-        } catch (redisError) {
-          console.error("Error querying Redis cache:", redisError);
-          // Continue with MongoDB results only
         }
 
-        // Sort all thread details by date (newest first)
-        allThreadDetails.sort((a, b) => b.parsedDate - a.parsedDate);
-
-        // Calculate pagination
-        totalResults = allThreadDetails.length;
-        const startIndex = (parseInt(page) - 1) * parseInt(pageSize);
-        const endIndex = startIndex + parseInt(pageSize);
-        filteredEmails = allThreadDetails.slice(startIndex, endIndex);
-
-        // Determine if there are more results
-        hasMore = endIndex < totalResults;
-
-        console.log(
-          `Returning ${filteredEmails.length} emails after hybrid search`
-        );
+        threadDetails = uniqueThreads;
+        threadDetails.sort((a, b) => b.parsedDate - a.parsedDate);
+        filteredEmails = threadDetails;
+        hasMore = startIndex + filteredEmails.length < totalResults;
       }
     }
 
