@@ -56,7 +56,7 @@ export const useEmails = ({
 
     // Determine if we're in search mode or default view
     const isSearchMode =
-      searchParams.search ||
+      !!searchParams.search ||
       searchParams.classification !== "all" ||
       searchParams.sentiment !== "all" ||
       searchParams.showUnreplied;
@@ -111,8 +111,8 @@ export const useEmails = ({
         params.append("needsResponse", "true");
       }
 
-      // Only include nextPageToken if we're on a page > 1 and have a token
-      if (currentPage > 1 && nextPageToken) {
+      // Only include nextPageToken if we have one for the current query/page context
+      if (nextPageToken) {
         params.append("nextPageToken", nextPageToken);
       }
 

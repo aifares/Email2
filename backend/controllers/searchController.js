@@ -1,44 +1,423 @@
 import { google } from "googleapis";
 import {
-  getUserCacheKey,
-  getAllThreads,
   getSearchResultsWithCache,
   getThreadDetails,
 } from "../utils/gmailService.js";
 import redis from "../config/redisClient.js";
 import { oauth2Client } from "../routes/authRoutes.js";
-import User from "../Models/User.js";
-import Email from "../Models/Email.js";
+import User from "../models/User.js";
+import Email from "../models/Email.js";
 import {
-  analyzeText,
   analyzeTextWithModel,
   getDefaultClassifierModel,
 } from "../utils/nlpAnalyzer.js";
 
 const INITIAL_FETCH_SIZE = 250;
 
-export const searchEmails = async (req, res) => {
-  try {
-    const {
-      firebaseUid,
-      query = "",
-      filter = "",
-      sentiment = "",
-      page = 1,
-      pageSize = 10,
-      nextPageToken = null,
-    } = req.query;
+// --- Helper Functions --- //
 
-    console.log("\n📍 GET /search endpoint hit");
-    console.log("Search params:", {
-      query,
-      filter,
-      sentiment,
-      page,
-      pageSize,
+/**
+ * Handles email search when a text query is provided.
+ * Searches Gmail, fetches details, applies NLP, filters, and paginates.
+ */
+async function _handleSearchWithQuery(gmail, user, params) {
+  const {
+    query,
+    filter,
+    sentiment,
+    page,
+    pageSize,
+    nextPageToken,
+    firebaseUid,
+  } = params;
+  const gmailQuery = `${query} in:anywhere`;
+  console.log(`_handleSearchWithQuery: Gmail query: ${gmailQuery}`);
+
+  const searchResults = await getSearchResultsWithCache(
+    gmail,
+    {
+      query: gmailQuery,
+      pageSize: INITIAL_FETCH_SIZE,
       nextPageToken,
+    },
+    firebaseUid,
+    redis
+  );
+
+  const newNextPageToken = searchResults.nextPageToken;
+  console.log(
+    "_handleSearchWithQuery: New next page token from Gmail:",
+    newNextPageToken
+  );
+
+  const processedThreadIds = new Set(); // Avoid processing duplicates from search results
+  const threadDetailsPromises = searchResults.emails
+    .filter((email) => {
+      if (processedThreadIds.has(email.threadId)) {
+        return false;
+      }
+      processedThreadIds.add(email.threadId);
+      return true;
+    })
+    .map(async (email) => {
+      try {
+        const threadData = await gmail.users.threads.get({
+          userId: "me",
+          id: email.threadId,
+          format: "metadata",
+          metadataHeaders: ["Subject", "From", "Date"],
+        });
+
+        const messages = threadData.data.messages;
+        if (!messages || messages.length === 0) {
+          console.warn(`Thread ${email.threadId} has no messages`);
+          return null;
+        }
+
+        const firstMessage = messages[0];
+        const latestMessage = messages[messages.length - 1];
+        const headers = latestMessage.payload.headers;
+        const originalHeaders = firstMessage.payload.headers;
+
+        const subject =
+          headers.find((h) => h.name === "Subject")?.value || "No Subject";
+        const textToAnalyze = subject + " " + latestMessage.snippet;
+        const aiAnalysis = await analyzeTextWithModel(
+          textToAnalyze,
+          user.classifierModel
+        );
+
+        const dateString = headers.find((h) => h.name === "Date")?.value || "";
+        const parsedDate = new Date(dateString);
+
+        return {
+          threadId: email.threadId,
+          messageCount: messages.length,
+          subject,
+          from: headers.find((h) => h.name === "From")?.value || "",
+          originalFrom:
+            originalHeaders.find((h) => h.name === "From")?.value || "",
+          date: dateString,
+          parsedDate: isNaN(parsedDate) ? new Date(0) : parsedDate,
+          snippet: latestMessage.snippet,
+          classification: aiAnalysis.classification,
+          sentiment: aiAnalysis.sentiment,
+        };
+      } catch (error) {
+        console.error(
+          `_handleSearchWithQuery: Error fetching details for thread ${email.threadId}:`,
+          error
+        );
+        return null;
+      }
     });
 
+  let threadDetails = (await Promise.all(threadDetailsPromises)).filter(
+    (detail) => detail !== null
+  );
+
+  // --- Post-fetch Filtering (JS-based) ---
+
+  // Validate search term presence
+  if (query && query.trim() !== "") {
+    const searchTerms = query.toLowerCase().split(/\s+/);
+    threadDetails = threadDetails.filter((thread) => {
+      const content = (thread.subject + " " + thread.snippet).toLowerCase();
+      return searchTerms.some((term) => content.includes(term));
+    });
+  }
+
+  // Apply classification filter
+  if (filter && filter !== "all") {
+    threadDetails = threadDetails.filter((email) => {
+      // Case-insensitive comparison for JS filtering
+      return email.classification?.toLowerCase() === filter.toLowerCase();
+    });
+  }
+
+  // Apply sentiment filter
+  if (sentiment && sentiment !== "all") {
+    threadDetails = threadDetails.filter((email) => {
+      // Case-insensitive comparison for JS filtering
+      return email.sentiment?.toLowerCase() === sentiment.toLowerCase();
+    });
+  }
+
+  // --- Pagination ---
+  threadDetails.sort((a, b) => b.parsedDate - a.parsedDate);
+
+  const totalResults = threadDetails.length;
+  const startIndex = (page - 1) * pageSize;
+  const endIndex = startIndex + pageSize;
+  const paginatedEmails = threadDetails.slice(startIndex, endIndex);
+
+  // Determine if there are more results based on fetched data and potential next page token
+  const hasMore = endIndex < totalResults || !!newNextPageToken;
+
+  return {
+    emails: paginatedEmails,
+    pagination: {
+      page,
+      pageSize,
+      hasMore,
+      totalResults, // Note: This total is for the *filtered* results from the initial fetch batch
+      nextPageToken: newNextPageToken, // Pass the token for subsequent fetches
+    },
+  };
+}
+
+/**
+ * Builds the MongoDB query for filtering when no text query is provided.
+ */
+function _buildMongoFilterQuery(userId, filter, sentiment) {
+  const mongoQuery = { userId };
+  const orConditions = [];
+
+  if (filter && filter !== "all") {
+    const filterRegex = new RegExp(`^${filter}$`, "i");
+    orConditions.push({ filter: filterRegex });
+    orConditions.push({ "AIAnalysis.classification": filterRegex });
+  }
+
+  if (sentiment && sentiment !== "all") {
+    const sentimentRegex = new RegExp(`^${sentiment}$`, "i");
+    orConditions.push({ sentiment: sentimentRegex });
+    orConditions.push({ "AIAnalysis.sentiment": sentimentRegex });
+  }
+
+  if (orConditions.length === 0) {
+    return mongoQuery; // No filters applied
+  }
+
+  if (filter && filter !== "all" && sentiment && sentiment !== "all") {
+    // Both filters are active, combine with $and
+    mongoQuery["$and"] = [
+      { $or: orConditions.slice(0, 2) }, // Filter conditions
+      { $or: orConditions.slice(2, 4) }, // Sentiment conditions
+    ];
+  } else {
+    // Only one filter type is active
+    mongoQuery["$or"] = orConditions;
+  }
+
+  return mongoQuery;
+}
+
+/**
+ * Handles email search when only filters (classification/sentiment) are provided.
+ * Queries MongoDB and fetches details for the results.
+ */
+async function _handleFilterOnlySearch(gmail, user, params) {
+  const { filter, sentiment, page, pageSize } = params;
+  console.log("_handleFilterOnlySearch: Filtering emails in MongoDB");
+
+  const mongoQuery = _buildMongoFilterQuery(user._id, filter, sentiment);
+
+  const totalResults = await Email.countDocuments(mongoQuery);
+  const startIndex = (page - 1) * pageSize;
+
+  const classifiedEmails = await Email.find(mongoQuery)
+    .sort({ emailDate: -1 }) // Sort by date in the database
+    .skip(startIndex)
+    .limit(pageSize)
+    .lean();
+
+  // Fetch details for the classified emails from Gmail to ensure data freshness
+  // Note: This still requires Gmail API calls for potentially stale data.
+  // Consider if fetching directly from DB is sufficient if data is kept up-to-date.
+  const threadDetailsPromises = classifiedEmails.map(
+    async (classifiedEmail) => {
+      try {
+        const threadData = await gmail.users.threads.get({
+          userId: "me",
+          id: classifiedEmail.threadId,
+          format: "metadata",
+          metadataHeaders: ["Subject", "From", "Date"],
+        });
+
+        const messages = threadData.data.messages;
+        if (!messages || messages.length === 0) {
+          return null;
+        }
+
+        const firstMessage = messages[0];
+        const latestMessage = messages[messages.length - 1];
+        const headers = latestMessage.payload.headers;
+        const originalHeaders = firstMessage.payload.headers;
+        const dateString = headers.find((h) => h.name === "Date")?.value || "";
+        const parsedDate = new Date(dateString);
+
+        // Check/update date stored in DB (optional - adds overhead)
+        if (parsedDate.getTime() !== classifiedEmail.emailDate?.getTime()) {
+          await Email.findByIdAndUpdate(classifiedEmail._id, {
+            emailDate: parsedDate,
+          }).catch((err) => console.error("DB Date Update Error:", err));
+        }
+
+        return {
+          threadId: classifiedEmail.threadId,
+          messageCount: messages.length,
+          subject:
+            headers.find((h) => h.name === "Subject")?.value || "No Subject",
+          from:
+            headers.find((h) => h.name === "From")?.value || "Unknown Sender",
+          originalFrom:
+            originalHeaders.find((h) => h.name === "From")?.value || "",
+          date: dateString,
+          parsedDate: isNaN(parsedDate) ? new Date(0) : parsedDate,
+          snippet: latestMessage.snippet,
+          // Use classification/sentiment from DB as source of truth here
+          classification:
+            classifiedEmail.AIAnalysis?.classification ||
+            classifiedEmail.filter,
+          sentiment:
+            classifiedEmail.AIAnalysis?.sentiment || classifiedEmail.sentiment,
+        };
+      } catch (error) {
+        console.error(
+          `_handleFilterOnlySearch: Error fetching details for thread ${classifiedEmail.threadId}:`,
+          error
+        );
+        // If Gmail fetch fails, maybe return data directly from DB?
+        // return {
+        //   threadId: classifiedEmail.threadId,
+        //   subject: classifiedEmail.subject || "No Subject",
+        //   // ... other fields from classifiedEmail
+        //   classification: classifiedEmail.AIAnalysis?.classification || classifiedEmail.filter,
+        //   sentiment: classifiedEmail.AIAnalysis?.sentiment || classifiedEmail.sentiment,
+        //   // Note: Some fields might be missing if only relying on DB
+        // };
+        return null;
+      }
+    }
+  );
+
+  let threadDetails = (await Promise.all(threadDetailsPromises)).filter(
+    (detail) => detail !== null
+  );
+
+  // Ensure uniqueness (shouldn't be strictly necessary if DB query is correct)
+  const uniqueThreads = [];
+  const seenThreadIds = new Set();
+  for (const thread of threadDetails) {
+    if (!seenThreadIds.has(thread.threadId)) {
+      seenThreadIds.add(thread.threadId);
+      uniqueThreads.push(thread);
+    }
+  }
+
+  // Sorting should ideally be handled by the DB query `.sort({ emailDate: -1 })`
+  // uniqueThreads.sort((a, b) => b.parsedDate - a.parsedDate); // Redundant if DB sort works
+
+  const hasMore = startIndex + uniqueThreads.length < totalResults;
+
+  return {
+    emails: uniqueThreads,
+    pagination: {
+      page,
+      pageSize,
+      hasMore,
+      totalResults,
+      nextPageToken: null, // No Gmail token when filtering DB
+    },
+  };
+}
+
+/**
+ * Handles the default email view (no query, no filters).
+ * Fetches threads directly from Gmail API.
+ */
+async function _handleDefaultEmailView(gmail, user, params) {
+  const { page, pageSize, nextPageToken, firebaseUid } = params;
+  console.log("_handleDefaultEmailView: Using default email view");
+
+  try {
+    const response = await gmail.users.threads.list({
+      userId: "me",
+      maxResults: pageSize,
+      pageToken: nextPageToken || null,
+    });
+
+    const threads = response.data.threads || [];
+    const newNextPageToken = response.data.nextPageToken;
+    const totalEstimate = Math.min(response.data.resultSizeEstimate || 0, 1000); // Gmail API limit
+
+    console.log(`✅ Retrieved ${threads.length} threads for default view`);
+    console.log(
+      `Page: ${page}, PageToken: ${nextPageToken || "null"}, New token: ${
+        newNextPageToken || "null"
+      }`
+    );
+
+    // Fetch details using the cached/optimized service function
+    const threadDetails = await getThreadDetails(
+      gmail,
+      threads.map((t) => t.id),
+      firebaseUid,
+      redis
+    );
+
+    // Ensure uniqueness (less critical here, but good practice)
+    const uniqueThreads = [];
+    const seenThreadIds = new Set();
+    for (const thread of threadDetails) {
+      if (!seenThreadIds.has(thread.threadId)) {
+        seenThreadIds.add(thread.threadId);
+        uniqueThreads.push(thread);
+      }
+    }
+
+    return {
+      emails: uniqueThreads || [],
+      pagination: {
+        page,
+        pageSize,
+        total: totalEstimate,
+        totalPages: Math.ceil(totalEstimate / pageSize),
+        hasMore: !!newNextPageToken,
+        nextPageToken: newNextPageToken,
+      },
+    };
+  } catch (error) {
+    console.error(
+      "_handleDefaultEmailView: Error fetching default emails:",
+      error
+    );
+    // If default view fails, maybe fallback to filter-only search?
+    // Or just return the error state.
+    throw error; // Re-throw to be caught by the main handler
+  }
+}
+
+// --- Main Controller --- //
+
+export const searchEmails = async (req, res) => {
+  const {
+    // Use const for query parameters
+    firebaseUid,
+    query = "",
+    filter = "",
+    sentiment = "",
+    page = 1,
+    pageSize = 10,
+    nextPageToken = null,
+  } = req.query;
+
+  // Convert page/pageSize to numbers early
+  const pageNum = parseInt(page) || 1;
+  const pageSizeNum = parseInt(pageSize) || 10;
+
+  console.log("\n📍 GET /search endpoint hit");
+  console.log("Search params:", {
+    query,
+    filter,
+    sentiment,
+    page: pageNum,
+    pageSize: pageSizeNum,
+    nextPageToken,
+  });
+
+  try {
     if (!firebaseUid) {
       return res.status(400).json({ error: "Firebase UID is required" });
     }
@@ -48,8 +427,8 @@ export const searchEmails = async (req, res) => {
       return res.status(401).json({ error: "Gmail not connected" });
     }
 
-    // Check if user has a classifier model, if not, assign the default one
     if (!user.classifierModel) {
+      console.log("Assigning default classifier model to user", user._id);
       user.classifierModel = getDefaultClassifierModel();
       await user.save();
     }
@@ -57,581 +436,59 @@ export const searchEmails = async (req, res) => {
     oauth2Client.setCredentials({ refresh_token: user.gmailRefreshToken });
     const gmail = google.gmail({ version: "v1", auth: oauth2Client });
 
-    let filteredEmails = [];
-    let totalResults = 0;
-    let hasMore = false;
-    let newNextPageToken = null;
+    let result;
+    const queryParams = {
+      firebaseUid,
+      query,
+      filter,
+      sentiment,
+      page: pageNum,
+      pageSize: pageSizeNum,
+      nextPageToken,
+    };
 
+    // Delegate to helper functions based on parameters
     if (query) {
-      // --- Query Handling (Modified for NLP Analysis) ---
-      const gmailQuery = `${query} in:anywhere`;
-      console.log(`Gmail query: ${gmailQuery}`);
-
-      // Track which thread IDs we've already processed to avoid duplicates
-      const processedThreadIds = new Set();
-
-      const searchResults = await getSearchResultsWithCache(
-        gmail,
-        {
-          query: gmailQuery,
-          pageSize: INITIAL_FETCH_SIZE,
-          nextPageToken,
-        },
-        firebaseUid,
-        redis
-      );
-
-      newNextPageToken = searchResults.nextPageToken;
-      console.log("New next page token from Gmail:", newNextPageToken);
-
-      const threadDetailsPromises = searchResults.emails.map(async (email) => {
-        try {
-          const threadData = await gmail.users.threads.get({
-            userId: "me",
-            id: email.threadId,
-            format: "metadata",
-            metadataHeaders: ["Subject", "From", "Date"],
-          });
-
-          const messages = threadData.data.messages;
-          if (!messages || messages.length === 0) {
-            console.warn(`Thread ${email.threadId} has no messages`);
-            return null;
-          }
-
-          // Get the first message (original sender) and last message
-          const firstMessage = messages[0];
-          const latestMessage = messages[messages.length - 1];
-          const headers = latestMessage.payload.headers;
-          const originalHeaders = firstMessage.payload.headers;
-
-          // --- Perform NLP Analysis using user's classifier model ---
-          const subject =
-            headers.find((h) => h.name === "Subject")?.value || "No Subject";
-          const textToAnalyze = subject + " " + latestMessage.snippet;
-          const aiAnalysis = analyzeTextWithModel(
-            textToAnalyze,
-            user.classifierModel
-          );
-          // --- End of NLP Analysis ---
-
-          const dateString =
-            headers.find((h) => h.name === "Date")?.value || "";
-          const parsedDate = new Date(dateString);
-
-          return {
-            threadId: email.threadId,
-            messageCount: messages.length,
-            subject: subject,
-            from: headers.find((h) => h.name === "From")?.value || "",
-            originalFrom:
-              originalHeaders.find((h) => h.name === "From")?.value || "",
-            date: dateString,
-            parsedDate: isNaN(parsedDate) ? new Date(0) : parsedDate,
-            snippet: latestMessage.snippet,
-            classification: aiAnalysis.classification,
-            sentiment: aiAnalysis.sentiment,
-          };
-        } catch (error) {
-          console.error(
-            `Error fetching details for thread ${email.threadId}:`,
-            error
-          );
-          return null;
-        }
-      });
-
-      let threadDetails = (await Promise.all(threadDetailsPromises)).filter(
-        (detail) => detail !== null
-      );
-
-      // Filter out duplicate threads
-      threadDetails = threadDetails.filter((thread) => {
-        if (processedThreadIds.has(thread.threadId)) {
-          return false;
-        }
-        processedThreadIds.add(thread.threadId);
-        return true;
-      });
-
-      // Add additional validation to ensure search term is actually present
-      // in the visible content (subject or snippet)
-      if (query && query.trim() !== "") {
-        const searchTerms = query.toLowerCase().split(/\s+/);
-        threadDetails = threadDetails.filter((thread) => {
-          const content = (thread.subject + " " + thread.snippet).toLowerCase();
-          return searchTerms.some((term) => content.includes(term));
-        });
-      }
-
-      if (filter && filter !== "all") {
-        threadDetails = threadDetails.filter(
-          (email) => email.classification === filter
-        );
-      }
-      if (sentiment && sentiment !== "all") {
-        threadDetails = threadDetails.filter(
-          (email) => email.sentiment === sentiment
-        );
-      }
-
-      threadDetails.sort((a, b) => b.parsedDate - a.parsedDate);
-
-      totalResults = threadDetails.length;
-      const startIndex = (parseInt(page) - 1) * parseInt(pageSize);
-      const endIndex = startIndex + parseInt(pageSize);
-      filteredEmails = threadDetails.slice(startIndex, endIndex);
-
-      // Determine if there are more results
-      hasMore = endIndex < totalResults || !!newNextPageToken;
-
-      // If we've reached the end of our current batch but have a nextPageToken,
-      // we should indicate there are more results
-      if (filteredEmails.length < parseInt(pageSize) && newNextPageToken) {
-        hasMore = true;
-      }
-      // --- End of Query Handling ---
+      result = await _handleSearchWithQuery(gmail, user, queryParams);
+    } else if (filter !== "all" || sentiment !== "all") {
+      result = await _handleFilterOnlySearch(gmail, user, queryParams);
     } else {
-      // If no search criteria are provided, use the same approach as threadController
-      if (
-        !query &&
-        (!filter || filter === "all") &&
-        (!sentiment || sentiment === "all")
-      ) {
-        try {
-          console.log("No search criteria provided, using default email view");
-
-          // Use the exact same approach as in threadController.getEmails
-          const response = await gmail.users.threads.list({
-            userId: "me",
-            maxResults: parseInt(pageSize),
-            pageToken: nextPageToken || null,
-          });
-
-          const threads = response.data.threads || [];
-          const newNextPageToken = response.data.nextPageToken;
-          const total = Math.min(response.data.resultSizeEstimate || 0, 1000); // Gmail API limit
-
-          console.log(
-            `✅ Retrieved ${threads.length} threads for default view`
-          );
-          console.log(
-            `Page: ${page}, PageToken: ${nextPageToken || "null"}, New token: ${
-              newNextPageToken || "null"
-            }`
-          );
-
-          // Fetch thread details for the current page
-          const threadDetails = await getThreadDetails(
-            gmail,
-            threads.map((t) => t.id),
-            firebaseUid,
-            redis
-          );
-
-          // Ensure no duplicate threads in the response
-          const uniqueThreads = [];
-          const seenThreadIds = new Set();
-
-          for (const thread of threadDetails) {
-            if (!seenThreadIds.has(thread.threadId)) {
-              seenThreadIds.add(thread.threadId);
-              uniqueThreads.push(thread);
-            }
-          }
-
-          // Return the same structure as threadController.getEmails
-          return res.json({
-            emails: uniqueThreads || [],
-            pagination: {
-              page: parseInt(page),
-              pageSize: parseInt(pageSize),
-              total,
-              totalPages: Math.ceil(total / parseInt(pageSize)),
-              hasMore: !!newNextPageToken,
-              nextPageToken: newNextPageToken,
-            },
-          });
-        } catch (error) {
-          console.error("Error fetching default emails:", error);
-          // Continue with the existing search logic as fallback
-        }
-      } else {
-        // --- Combined approach: Check both MongoDB and Redis cache ---
-        console.log("Filtering by sentiment/classification");
-
-        // First check Redis cache for matching threads
-        try {
-          console.log("Checking Redis cache for matching threads");
-
-          // Get thread details cache - correct key based on actual Redis structure
-          const threadDetailsKey = `user:thread-details:search:"${firebaseUid}"`;
-          const cachedDetailsStr = await redis.get(threadDetailsKey);
-
-          if (cachedDetailsStr) {
-            console.log("Found cached thread details in Redis");
-
-            const cachedDetails = JSON.parse(cachedDetailsStr);
-            const cachedThreads = [];
-
-            // Convert the object to an array of threads with IDs
-            for (const [threadId, details] of Object.entries(cachedDetails)) {
-              if (details) {
-                cachedThreads.push({
-                  threadId,
-                  ...details,
-                  classification: details.classification || "Unknown",
-                  sentiment: details.sentiment || "neutral",
-                });
-              }
-            }
-
-            // Filter by sentiment/classification
-            let filteredCachedThreads = cachedThreads;
-
-            if (filter && filter !== "all") {
-              console.log(
-                `Filtering Redis results by classification: ${filter}`
-              );
-              filteredCachedThreads = filteredCachedThreads.filter(
-                (thread) => thread.classification === filter
-              );
-            }
-
-            if (sentiment && sentiment !== "all") {
-              console.log(`Filtering Redis results by sentiment: ${sentiment}`);
-              // Handle case-insensitive comparison for sentiment
-              const normalizedSentiment = sentiment.toLowerCase();
-              filteredCachedThreads = filteredCachedThreads.filter((thread) => {
-                // Check various formats the sentiment might be stored in
-                const threadSentiment = thread.sentiment
-                  ? thread.sentiment.toLowerCase()
-                  : "";
-                console.log(
-                  `Thread ${thread.threadId} has sentiment: ${threadSentiment}`
-                );
-
-                return (
-                  threadSentiment === normalizedSentiment ||
-                  // Check for alternative formats
-                  (normalizedSentiment === "positive" &&
-                    threadSentiment.includes("posit")) ||
-                  (normalizedSentiment === "negative" &&
-                    threadSentiment.includes("negat")) ||
-                  (normalizedSentiment === "neutral" &&
-                    threadSentiment.includes("neutr"))
-                );
-              });
-            }
-
-            console.log(
-              `Found ${filteredCachedThreads.length} matching threads in Redis cache`
-            );
-
-            // Store the Redis results to combine with MongoDB later
-            if (filteredCachedThreads.length > 0) {
-              // Save ThreadIDs we've found in Redis to avoid duplicates
-              const redisThreadIds = new Set(
-                filteredCachedThreads.map((thread) => thread.threadId)
-              );
-
-              // Get results from MongoDB too, excluding ones we already have from Redis
-              console.log("Now checking MongoDB for additional results");
-
-              let mongoQuery = { userId: user._id };
-
-              // Add filters
-              if (filter && filter !== "all") {
-                console.log(`Filtering MongoDB by classification: ${filter}`);
-                mongoQuery["AIAnalysis.classification"] = filter;
-              }
-
-              if (sentiment && sentiment !== "all") {
-                console.log(`Filtering MongoDB by sentiment: ${sentiment}`);
-                // Create a case-insensitive regex query for sentiment
-                const sentimentRegex = new RegExp(`^${sentiment}$`, "i");
-                mongoQuery["AIAnalysis.sentiment"] = sentimentRegex;
-              }
-
-              // Exclude threads we already have from Redis
-              if (redisThreadIds.size > 0) {
-                mongoQuery.threadId = { $nin: Array.from(redisThreadIds) };
-              }
-
-              console.log("MongoDB query:", JSON.stringify(mongoQuery));
-
-              // Get total count for pagination info
-              const totalMongoCount = await Email.countDocuments(mongoQuery);
-              console.log(
-                `Found ${totalMongoCount} additional matching documents in MongoDB`
-              );
-
-              // Get all results from MongoDB (not paginated yet)
-              const classifiedEmails = await Email.find(mongoQuery)
-                .sort({ emailDate: -1 })
-                .lean();
-
-              console.log(
-                `Retrieved ${classifiedEmails.length} additional emails from MongoDB`
-              );
-
-              // Process MongoDB results
-              const mongoThreadDetailsPromises = classifiedEmails.map(
-                async (classifiedEmail) => {
-                  try {
-                    const threadData = await gmail.users.threads.get({
-                      userId: "me",
-                      id: classifiedEmail.threadId,
-                      format: "metadata",
-                      metadataHeaders: ["Subject", "From", "Date"],
-                    });
-
-                    const messages = threadData.data.messages;
-                    if (!messages || messages.length === 0) {
-                      console.warn(
-                        `Thread ${classifiedEmail.threadId} has no messages`
-                      );
-                      return null;
-                    }
-
-                    // Get the first message (original sender) and last message
-                    const firstMessage = messages[0];
-                    const latestMessage = messages[messages.length - 1];
-                    const headers = latestMessage.payload.headers;
-                    const originalHeaders = firstMessage.payload.headers;
-                    const dateString =
-                      headers.find((h) => h.name === "Date")?.value || "";
-                    const parsedDate = new Date(dateString);
-
-                    return {
-                      threadId: classifiedEmail.threadId,
-                      messageCount: messages.length,
-                      subject:
-                        headers.find((h) => h.name === "Subject")?.value ||
-                        "No Subject",
-                      from:
-                        headers.find((h) => h.name === "From")?.value ||
-                        "Unknown Sender",
-                      originalFrom:
-                        originalHeaders.find((h) => h.name === "From")?.value ||
-                        "",
-                      date: dateString,
-                      parsedDate: isNaN(parsedDate) ? new Date(0) : parsedDate,
-                      snippet: latestMessage.snippet,
-                      classification:
-                        classifiedEmail.AIAnalysis?.classification,
-                      sentiment: classifiedEmail.AIAnalysis?.sentiment,
-                    };
-                  } catch (error) {
-                    console.error(
-                      `Error fetching details for thread ${classifiedEmail.threadId}:`,
-                      error
-                    );
-                    return null;
-                  }
-                }
-              );
-
-              const mongoThreadDetails = (
-                await Promise.all(mongoThreadDetailsPromises)
-              ).filter((detail) => detail !== null);
-
-              // Combine results from Redis and MongoDB
-              console.log(
-                `Combining ${filteredCachedThreads.length} Redis results with ${mongoThreadDetails.length} MongoDB results`
-              );
-              const allThreadDetails = [
-                ...filteredCachedThreads,
-                ...mongoThreadDetails,
-              ];
-
-              // Sort all results by date
-              allThreadDetails.sort((a, b) => {
-                const dateA =
-                  a.parsedDate || (a.date ? new Date(a.date) : new Date(0));
-                const dateB =
-                  b.parsedDate || (b.date ? new Date(b.date) : new Date(0));
-                return dateB - dateA;
-              });
-
-              // Apply pagination to combined results
-              const startIndex = (parseInt(page) - 1) * parseInt(pageSize);
-              const endIndex = startIndex + parseInt(pageSize);
-              filteredEmails = allThreadDetails.slice(startIndex, endIndex);
-
-              // Calculate pagination info
-              totalResults = allThreadDetails.length;
-              hasMore = endIndex < totalResults;
-
-              console.log(
-                `Returning ${
-                  filteredEmails.length
-                } emails from combined sources (page ${page} of ${Math.ceil(
-                  totalResults / parseInt(pageSize)
-                )})`
-              );
-
-              return res.json({
-                emails: filteredEmails,
-                pagination: {
-                  page: parseInt(page),
-                  pageSize: parseInt(pageSize),
-                  hasMore,
-                  totalResults,
-                  nextPageToken: null,
-                },
-              });
-            }
-          }
-        } catch (error) {
-          console.error("Error querying Redis cache:", error);
-          // Continue to MongoDB as fallback
-        }
-
-        // Fallback to MongoDB if Redis doesn't have matching results
-        console.log("Falling back to MongoDB for filtering");
-
-        let mongoQuery = { userId: user._id };
-
-        if (filter && filter !== "all") {
-          console.log(`Filtering MongoDB by classification: ${filter}`);
-          mongoQuery["AIAnalysis.classification"] = filter;
-        }
-
-        if (sentiment && sentiment !== "all") {
-          console.log(`Filtering MongoDB by sentiment: ${sentiment}`);
-          // Create a case-insensitive regex query for sentiment
-          const sentimentRegex = new RegExp(`^${sentiment}$`, "i");
-          mongoQuery["AIAnalysis.sentiment"] = sentimentRegex;
-
-          // Log the MongoDB query for debugging
-          console.log("MongoDB query:", JSON.stringify(mongoQuery));
-        }
-
-        totalResults = await Email.countDocuments(mongoQuery);
-        const startIndex = (parseInt(page) - 1) * parseInt(pageSize);
-
-        const classifiedEmails = await Email.find(mongoQuery)
-          .sort({ emailDate: -1 })
-          .skip(startIndex)
-          .limit(parseInt(pageSize))
-          .lean();
-
-        console.log(
-          `Found ${classifiedEmails.length} matching emails in MongoDB`
-        );
-
-        const threadDetailsPromises = classifiedEmails.map(
-          async (classifiedEmail) => {
-            try {
-              const threadData = await gmail.users.threads.get({
-                userId: "me",
-                id: classifiedEmail.threadId,
-                format: "metadata",
-                metadataHeaders: ["Subject", "From", "Date"],
-              });
-
-              const messages = threadData.data.messages;
-              if (!messages || messages.length === 0) {
-                console.warn(
-                  `Thread ${classifiedEmail.threadId} has no messages`
-                );
-                return null;
-              }
-
-              // Get the first message (original sender) and last message
-              const firstMessage = messages[0];
-              const latestMessage = messages[messages.length - 1];
-              const headers = latestMessage.payload.headers;
-              const originalHeaders = firstMessage.payload.headers;
-              const dateString =
-                headers.find((h) => h.name === "Date")?.value || "";
-              const parsedDate = new Date(dateString);
-
-              if (isNaN(parsedDate.getTime())) {
-                console.warn(
-                  `Invalid date string for thread ${classifiedEmail.threadId}: ${dateString}`
-                );
-              }
-
-              // Update the email date in the database if it's different
-              if (
-                parsedDate.getTime() !== classifiedEmail.emailDate?.getTime()
-              ) {
-                await Email.findByIdAndUpdate(classifiedEmail._id, {
-                  emailDate: parsedDate,
-                });
-              }
-
-              return {
-                threadId: classifiedEmail.threadId,
-                messageCount: messages.length,
-                subject:
-                  headers.find((h) => h.name === "Subject")?.value ||
-                  "No Subject",
-                from:
-                  headers.find((h) => h.name === "From")?.value ||
-                  "Unknown Sender",
-                originalFrom:
-                  originalHeaders.find((h) => h.name === "From")?.value || "",
-                date: dateString,
-                parsedDate: isNaN(parsedDate) ? new Date(0) : parsedDate,
-                snippet: latestMessage.snippet,
-                classification: classifiedEmail.AIAnalysis?.classification,
-                sentiment: classifiedEmail.AIAnalysis?.sentiment,
-              };
-            } catch (error) {
-              console.error(
-                `Error fetching details for thread ${classifiedEmail.threadId}:`,
-                error
-              );
-              return null;
-            }
-          }
-        );
-
-        let threadDetails = (await Promise.all(threadDetailsPromises)).filter(
-          (detail) => detail !== null
-        );
-
-        // Ensure no duplicate threads
-        const uniqueThreads = [];
-        const seenThreadIds = new Set();
-
-        for (const thread of threadDetails) {
-          if (!seenThreadIds.has(thread.threadId)) {
-            seenThreadIds.add(thread.threadId);
-            uniqueThreads.push(thread);
-          }
-        }
-
-        threadDetails = uniqueThreads;
-        threadDetails.sort((a, b) => b.parsedDate - a.parsedDate);
-        filteredEmails = threadDetails;
-        hasMore = startIndex + filteredEmails.length < totalResults;
+      // Attempt default view, fallback might be needed if it errors
+      try {
+        result = await _handleDefaultEmailView(gmail, user, queryParams);
+      } catch (defaultViewError) {
+        // Log the error and potentially return an error response or empty results
+        console.error("Fallback from default view error:", defaultViewError);
+        // Decide on fallback behavior: rethrow, return empty, or try filterOnly?
+        // For now, return a specific error indicating default view failed.
+        return res.status(500).json({
+          error: "Failed to fetch default email view",
+          message: defaultViewError.message,
+          emails: [],
+          pagination: {
+            page: pageNum,
+            pageSize: pageSizeNum,
+            hasMore: false,
+            nextPageToken: null,
+            totalResults: 0,
+          },
+        });
       }
     }
 
-    res.json({
-      emails: filteredEmails,
-      pagination: {
-        page: parseInt(page),
-        pageSize: parseInt(pageSize),
-        hasMore,
-        totalResults,
-        nextPageToken: newNextPageToken,
-      },
-    });
+    // Send the successful response
+    res.json(result);
   } catch (error) {
     console.error("❌ Error in /search endpoint:", error);
     console.error(error.stack);
+    // Generic error response for unexpected issues
     res.status(500).json({
       error: "Failed to search emails",
       message: error.message,
       emails: [],
       pagination: {
-        page: 1,
-        pageSize: 10,
+        page: pageNum,
+        pageSize: pageSizeNum,
         hasMore: false,
         nextPageToken: null,
         totalResults: 0,

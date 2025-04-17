@@ -1,7 +1,7 @@
 import { google } from "googleapis";
 import { analyzeText, analyzeTextWithModel } from "../utils/nlpAnalyzer.js";
-import User from "../Models/User.js";
-import Email from "../Models/Email.js";
+import User from "../models/User.js";
+import Email from "../models/Email.js";
 import { oauth2Client } from "../routes/authRoutes.js";
 import redis from "../config/redisClient.js";
 
