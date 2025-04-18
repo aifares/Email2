@@ -1,6 +1,8 @@
 import { Mail } from "lucide-react";
 import Link from "next/link";
+import { useState } from "react";
 import { EmailData } from "./types";
+import { EmailDetailModal } from "./EmailDetailModal";
 
 interface EmailTableProps {
   emails: EmailData[];
@@ -8,6 +10,18 @@ interface EmailTableProps {
 }
 
 export const EmailTable = ({ emails, isLoading }: EmailTableProps) => {
+  const [selectedEmail, setSelectedEmail] = useState<EmailData | null>(null);
+  const [isModalOpen, setIsModalOpen] = useState(false);
+
+  const openEmailModal = (email: EmailData) => {
+    setSelectedEmail(email);
+    setIsModalOpen(true);
+  };
+
+  const closeEmailModal = () => {
+    setIsModalOpen(false);
+  };
+
   if (isLoading) {
     return (
       <div className="flex justify-center p-4">
@@ -98,42 +112,54 @@ export const EmailTable = ({ emails, isLoading }: EmailTableProps) => {
   };
 
   return (
-    <div className="overflow-x-auto">
-      <table className="table table-sm table-zebra">
-        <thead>
-          <tr className="text-xs bg-base-200/50">
-            <th className="font-medium">From</th>
-            <th className="font-medium">Subject</th>
-            <th className="font-medium">Date</th>
-            <th className="font-medium">Sentiment</th>
-            <th className="font-medium">Classification</th>
-            <th className="font-medium text-right">Actions</th>
-          </tr>
-        </thead>
-        <tbody>
-          {emails.map((email) => (
-            <tr key={email.threadId} className="hover:bg-base-200/50">
-              <td className="whitespace-nowrap">
-                {typeof email.from === "object"
-                  ? email.from.name || email.from.email
-                  : email.from}
-              </td>
-              <td className="max-w-[300px] truncate">{email.subject}</td>
-              <td className="whitespace-nowrap">{formatDate(email.date)}</td>
-              <td>{getSentimentBadge(email.sentiment)}</td>
-              <td>{getClassificationBadge(email.classification)}</td>
-              <td className="text-right">
-                <Link
-                  href={`/dashboard/emails/${email.threadId}`}
-                  className="btn btn-xs btn-ghost"
-                >
-                  View
-                </Link>
-              </td>
+    <>
+      <div className="overflow-x-auto">
+        <table className="table table-sm table-zebra">
+          <thead>
+            <tr className="text-xs bg-base-200/50">
+              <th className="font-medium">From</th>
+              <th className="font-medium">Subject</th>
+              <th className="font-medium">Date</th>
+              <th className="font-medium">Sentiment</th>
+              <th className="font-medium">Classification</th>
+              <th className="font-medium text-right">Actions</th>
             </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
+          </thead>
+          <tbody>
+            {emails.map((email) => (
+              <tr 
+                key={email.threadId} 
+                className="hover:bg-base-200/50 cursor-pointer"
+                onClick={() => openEmailModal(email)}
+              >
+                <td className="whitespace-nowrap">
+                  {typeof email.from === "object"
+                    ? email.from.name || email.from.email
+                    : email.from}
+                </td>
+                <td className="max-w-[300px] truncate">{email.subject}</td>
+                <td className="whitespace-nowrap">{formatDate(email.date)}</td>
+                <td>{getSentimentBadge(email.sentiment)}</td>
+                <td>{getClassificationBadge(email.classification)}</td>
+                <td className="text-right" onClick={(e) => e.stopPropagation()}>
+                  <Link
+                    href={`/dashboard/emails/${email.threadId}`}
+                    className="btn btn-xs btn-ghost"
+                  >
+                    View
+                  </Link>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <EmailDetailModal 
+        isOpen={isModalOpen}
+        onClose={closeEmailModal}
+        email={selectedEmail}
+      />
+    </>
   );
 };
