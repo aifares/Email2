@@ -14,6 +14,7 @@ import analyticsRoutes from "./routes/analyticsRoutes.js";
 import agentRoutes from "./routes/agentRoutes.js";
 import insightRoutes from "./routes/insightRoutes.js";
 import firebaseAuthRoutes from "./routes/firebaseAuthRoutes.js";
+import calendarRoutes from "./routes/calendarRoutes.js";
 
 const app = express();
 
@@ -54,3 +55,4 @@ app.use("/analytics", analyticsRoutes);
 app.use("/agents", agentRoutes);
 app.use("/insights", insightRoutes);
 app.use("/firebase-auth", firebaseAuthRoutes);
+app.use("/api/calendar", calendarRoutes);

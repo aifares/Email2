@@ -16,6 +16,7 @@ const SCOPES = [
   "https://www.googleapis.com/auth/userinfo.email",
   "https://www.googleapis.com/auth/userinfo.profile",
   "https://mail.google.com/",
+  "https://www.googleapis.com/auth/calendar.events",
   "email",
   "profile",
   "openid",
